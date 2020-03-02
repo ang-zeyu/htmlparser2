@@ -50,26 +50,6 @@ const enum State {
     BeforeSpecial, //S
     BeforeSpecialEnd, //S
 
-    BeforeScript1, //C
-    BeforeScript2, //R
-    BeforeScript3, //I
-    BeforeScript4, //P
-    BeforeScript5, //T
-    AfterScript1, //C
-    AfterScript2, //R
-    AfterScript3, //I
-    AfterScript4, //P
-    AfterScript5, //T
-
-    BeforeStyle1, //T
-    BeforeStyle2, //Y
-    BeforeStyle3, //L
-    BeforeStyle4, //E
-    AfterStyle1, //T
-    AfterStyle2, //Y
-    AfterStyle3, //L
-    AfterStyle4, //E
-
     BeforeEntity, //&
     BeforeNumericEntity, //#
     InNamedEntity,
@@ -78,9 +58,13 @@ const enum State {
 }
 
 const enum Special {
-    None = 1,
-    Script,
-    Style
+    None = -1
+}
+
+const enum SpecialProcessing {
+    HAS_MATCHING = -3,
+    NO_MATCH,
+    HAS_MATCHED
 }
 
 function whitespace(c: string): boolean {
@@ -128,19 +112,6 @@ function ifElseState(upper: string, SUCCESS: State, FAILURE: State) {
     }
 }
 
-function consumeSpecialNameChar(upper: string, NEXT_STATE: State) {
-    const lower = upper.toLowerCase();
-
-    return (t: Tokenizer, c: string) => {
-        if (c === lower || c === upper) {
-            t._state = NEXT_STATE;
-        } else {
-            t._state = State.InTagName;
-            t._index--; //consume the token again
-        }
-    };
-}
-
 const stateBeforeCdata1 = ifElseState(
     "C",
     State.BeforeCdata2,
@@ -166,24 +137,6 @@ const stateBeforeCdata5 = ifElseState(
     State.BeforeCdata6,
     State.InDeclaration
 );
-
-const stateBeforeScript1 = consumeSpecialNameChar("R", State.BeforeScript2);
-const stateBeforeScript2 = consumeSpecialNameChar("I", State.BeforeScript3);
-const stateBeforeScript3 = consumeSpecialNameChar("P", State.BeforeScript4);
-const stateBeforeScript4 = consumeSpecialNameChar("T", State.BeforeScript5);
-
-const stateAfterScript1 = ifElseState("R", State.AfterScript2, State.Text);
-const stateAfterScript2 = ifElseState("I", State.AfterScript3, State.Text);
-const stateAfterScript3 = ifElseState("P", State.AfterScript4, State.Text);
-const stateAfterScript4 = ifElseState("T", State.AfterScript5, State.Text);
-
-const stateBeforeStyle1 = consumeSpecialNameChar("Y", State.BeforeStyle2);
-const stateBeforeStyle2 = consumeSpecialNameChar("L", State.BeforeStyle3);
-const stateBeforeStyle3 = consumeSpecialNameChar("E", State.BeforeStyle4);
-
-const stateAfterStyle1 = ifElseState("Y", State.AfterStyle2, State.Text);
-const stateAfterStyle2 = ifElseState("L", State.AfterStyle3, State.Text);
-const stateAfterStyle3 = ifElseState("E", State.AfterStyle4, State.Text);
 
 const stateBeforeEntity = ifElseState(
     "#",
@@ -214,6 +167,11 @@ export default class Tokenizer {
     _baseState = State.Text;
     /** For special parsing behavior inside of script and style tags. */
     _special = Special.None;
+    /** For matching special tags. */
+    _specialTagNames: string[];
+    /** For matching special tags during BEFORE_SPECIAL(_END) */
+    _matchingSpecialTagIndexes: number[] = [];
+    _nextSpecialTagMatchIndex = 0;
     /** Indicates whether the tokenizer has been paused. */
     _running = true;
     /** Indicates whether the tokenizer has finished running / `.end` has been called. */
@@ -224,12 +182,21 @@ export default class Tokenizer {
     _decodeEntities: boolean;
 
     constructor(
-        options: { xmlMode?: boolean; decodeEntities?: boolean } | null,
+        options: {
+            xmlMode?: boolean;
+            decodeEntities?: boolean;
+            specialTagNames?: string[];
+        } | null,
         cbs: Callbacks
     ) {
         this._cbs = cbs;
         this._xmlMode = !!(options && options.xmlMode);
         this._decodeEntities = !!(options && options.decodeEntities);
+        this._specialTagNames = [
+            'script',
+            'style',
+            ...((options && options.specialTagNames) || [])
+        ].map(tag => tag.toLowerCase());
     }
 
     reset() {
@@ -242,6 +209,14 @@ export default class Tokenizer {
         this._special = Special.None;
         this._running = true;
         this._ended = false;
+    }
+
+    injectIgnoreTags(tagsToIgnore: string[]) {
+        this._specialTagNames = [
+            'script',
+            'style',
+            ...tagsToIgnore
+        ];
     }
 
     _stateText(c: string) {
@@ -283,8 +258,9 @@ export default class Tokenizer {
             this._state = State.InProcessingInstruction;
             this._sectionStart = this._index + 1;
         } else {
+            /** Patched entry point to special state. */
             this._state =
-                !this._xmlMode && (c === "s" || c === "S")
+                !this._xmlMode && this._matchSpecialTagsFirstCharacters(c)
                     ? State.BeforeSpecial
                     : State.InTagName;
             this._sectionStart = this._index;
@@ -303,7 +279,11 @@ export default class Tokenizer {
         } else if (c === ">") {
             this._state = State.Text;
         } else if (this._special !== Special.None) {
-            if (c === "s" || c === "S") {
+            /**
+             * Changes the Tokenizer state to BEFORE_SPECIAL_END if the token matches one of
+             * the first character of the currently matched special tag.
+             */
+            if (this._matchNextSpecialTagClosingCharacter(c) !== SpecialProcessing.NO_MATCH) {
                 this._state = State.BeforeSpecialEnd;
             } else {
                 this._state = State.Text;
@@ -503,55 +483,114 @@ export default class Tokenizer {
         }
         //else: stay in AFTER_CDATA_2 (`]]]>`)
     }
+    _matchSpecialTagsFirstCharacters(c: string) {
+        this._matchingSpecialTagIndexes = [];
+        const numSpecialTags = this._specialTagNames.length;
+        const lowerCaseChar = c.toLowerCase();
+        for (let j = 0; j < numSpecialTags; j += 1) {
+            if (lowerCaseChar === this._specialTagNames[j][0]) {
+                this._matchingSpecialTagIndexes.push(j)
+            }
+        }
+
+        if (this._matchingSpecialTagIndexes.length > 0) {
+            this._nextSpecialTagMatchIndex = 1;
+            return true;
+        }
+        return false;
+    }
+    _matchSpecialTagsNextCharacters(c: string) {
+        const newMatchingSpecialTagIndexes: number[] = [];
+        const numMatchingTags = this._matchingSpecialTagIndexes.length;
+        const lowerCaseChar = c.toLowerCase();
+
+        for (let j = 0; j < numMatchingTags; j += 1) {
+            const tagIndex = this._matchingSpecialTagIndexes[j];
+            const testChar = this._specialTagNames[tagIndex][this._nextSpecialTagMatchIndex];
+
+            if (testChar === undefined) {
+                if (c === "/" || c === ">" || whitespace(c)) {
+                    return tagIndex;
+                }
+            } else if (testChar === lowerCaseChar) {
+                newMatchingSpecialTagIndexes.push(tagIndex);
+            }
+        }
+
+        this._matchingSpecialTagIndexes = newMatchingSpecialTagIndexes;
+
+        return this._matchingSpecialTagIndexes.length > 0
+            ? SpecialProcessing.HAS_MATCHING
+            : SpecialProcessing.NO_MATCH;
+    }
+
+    /**
+     * Changes the Tokenizer state to IN_TAG_NAME or BEFORE_SPECIAL state again depending
+     * on whether there are still matches in _matchingSpecialTagIndexes.
+     */
     _stateBeforeSpecial(c: string) {
-        if (c === "c" || c === "C") {
-            this._state = State.BeforeScript1;
-        } else if (c === "t" || c === "T") {
-            this._state = State.BeforeStyle1;
-        } else {
-            this._state = State.InTagName;
-            this._index--; //consume the token again
+        const result = this._matchSpecialTagsNextCharacters(c);
+        if (result === SpecialProcessing.HAS_MATCHING) {
+            this._nextSpecialTagMatchIndex += 1;
+            return;
         }
+
+        // Reset for processSpecialClosingTagCharacter later
+        this._nextSpecialTagMatchIndex = 0;
+
+        this._state = State.InTagName;
+        this._index--; //consume the token again
+
+        if (result === SpecialProcessing.NO_MATCH) {
+            return;
+        }
+
+        this._special = result;
     }
+
+    /**
+     * Processes the _special flag and _nextSpecialTagMatchIndex state variable,
+     * returning a flag indicating whether the current special tag has finished matching or not.
+     */
+    _matchNextSpecialTagClosingCharacter(c: string) {
+        const nextTestChar = this._specialTagNames[this._special][this._nextSpecialTagMatchIndex];
+
+        if (nextTestChar === undefined) {
+            this._nextSpecialTagMatchIndex = 0;
+            return (c === ">" || whitespace(c))
+                ? SpecialProcessing.HAS_MATCHED
+                : SpecialProcessing.NO_MATCH;
+        } else if (nextTestChar === c.toLowerCase()) {
+            this._nextSpecialTagMatchIndex += 1;
+            return SpecialProcessing.HAS_MATCHING;
+        }
+
+        this._nextSpecialTagMatchIndex = 0;
+        return SpecialProcessing.NO_MATCH;
+    };
+
+    /**
+     * Changes the Tokenizer state back to Text, InTagName depending
+     * on whether the token has finished or is still matching
+     * the currently matched special tag.
+     */
     _stateBeforeSpecialEnd(c: string) {
-        if (this._special === Special.Script && (c === "c" || c === "C")) {
-            this._state = State.AfterScript1;
-        } else if (
-            this._special === Special.Style &&
-            (c === "t" || c === "T")
-        ) {
-            this._state = State.AfterStyle1;
-        } else this._state = State.Text;
-    }
-    _stateBeforeScript5(c: string) {
-        if (c === "/" || c === ">" || whitespace(c)) {
-            this._special = Special.Script;
+        const result = this._matchNextSpecialTagClosingCharacter(c);
+        if (result === SpecialProcessing.HAS_MATCHING) {
+            return;
         }
-        this._state = State.InTagName;
-        this._index--; //consume the token again
-    }
-    _stateAfterScript5(c: string) {
-        if (c === ">" || whitespace(c)) {
+
+        if (result === SpecialProcessing.HAS_MATCHED) {
+            this._sectionStart = this._index - this._specialTagNames[this._special].length;
             this._special = Special.None;
             this._state = State.InClosingTagName;
-            this._sectionStart = this._index - 6;
             this._index--; //reconsume the token
-        } else this._state = State.Text;
-    }
-    _stateBeforeStyle4(c: string) {
-        if (c === "/" || c === ">" || whitespace(c)) {
-            this._special = Special.Style;
+            return;
         }
-        this._state = State.InTagName;
-        this._index--; //consume the token again
-    }
-    _stateAfterStyle4(c: string) {
-        if (c === ">" || whitespace(c)) {
-            this._special = Special.None;
-            this._state = State.InClosingTagName;
-            this._sectionStart = this._index - 5;
-            this._index--; //reconsume the token
-        } else this._state = State.Text;
+
+        // No match
+        this._index--;
+        this._state = State.Text;
     }
     //for entities terminated with a semicolon
     _parseNamedEntityStrict() {
@@ -740,44 +779,8 @@ export default class Tokenizer {
                 this._stateBeforeComment(c);
             } else if (this._state === State.BeforeSpecialEnd) {
                 this._stateBeforeSpecialEnd(c);
-            } else if (this._state === State.AfterScript1) {
-                stateAfterScript1(this, c);
-            } else if (this._state === State.AfterScript2) {
-                stateAfterScript2(this, c);
-            } else if (this._state === State.AfterScript3) {
-                stateAfterScript3(this, c);
-            } else if (this._state === State.BeforeScript1) {
-                stateBeforeScript1(this, c);
-            } else if (this._state === State.BeforeScript2) {
-                stateBeforeScript2(this, c);
-            } else if (this._state === State.BeforeScript3) {
-                stateBeforeScript3(this, c);
-            } else if (this._state === State.BeforeScript4) {
-                stateBeforeScript4(this, c);
-            } else if (this._state === State.BeforeScript5) {
-                this._stateBeforeScript5(c);
-            } else if (this._state === State.AfterScript4) {
-                stateAfterScript4(this, c);
-            } else if (this._state === State.AfterScript5) {
-                this._stateAfterScript5(c);
-            } else if (this._state === State.BeforeStyle1) {
-                stateBeforeStyle1(this, c);
             } else if (this._state === State.InCdata) {
                 this._stateInCdata(c);
-            } else if (this._state === State.BeforeStyle2) {
-                stateBeforeStyle2(this, c);
-            } else if (this._state === State.BeforeStyle3) {
-                stateBeforeStyle3(this, c);
-            } else if (this._state === State.BeforeStyle4) {
-                this._stateBeforeStyle4(c);
-            } else if (this._state === State.AfterStyle1) {
-                stateAfterStyle1(this, c);
-            } else if (this._state === State.AfterStyle2) {
-                stateAfterStyle2(this, c);
-            } else if (this._state === State.AfterStyle3) {
-                stateAfterStyle3(this, c);
-            } else if (this._state === State.AfterStyle4) {
-                this._stateAfterStyle4(c);
             } else if (this._state === State.InProcessingInstruction) {
                 this._stateInProcessingInstruction(c);
             } else if (this._state === State.InNamedEntity) {
